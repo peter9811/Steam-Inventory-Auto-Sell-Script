@@ -384,13 +384,15 @@
 	}
 
 	/**
-	 * Checks if an element is visible.
-	 * @param {Element} el - The element to check.
-	 * @returns {boolean} True if visible.
+	 * Checks if an element is visible (not hidden).
+	 * @param {Element} el - The element.
+	 * @returns {boolean}
 	 */
 	function isVisible(el) {
 		if (!el) return false;
 		if (el?.style?.display === "none") return false;
+		if (el?.style?.visibility === "hidden" || el?.style?.visibility === "collapse") return false;
+		if (el.offsetParent === null && (el.offsetWidth === 0 || el.offsetHeight === 0)) return false;
 		return true;
 	}
 
@@ -571,7 +573,8 @@
 				timeoutMs: runtimeConfig.SELL_DIALOG_APPEAR_TIMEOUT_MS,
 				intervalMs: runtimeConfig.SELL_DIALOG_POLL_INTERVAL_MS,
 				label: "sell dialog",
-				shouldStop,
+				shouldStop: () => shouldStop?.(),
+				pauseState: null,
 			}
 		);
 	}
@@ -979,8 +982,7 @@
 			return null;
 		}
 		if (containers.length > 1) {
-			warn(`Multiple visible inventory containers found: ${containers.length}. Stopping.`);
-			return null;
+			warn(`Multiple visible inventory containers found: ${containers.length}. Using the first.`);
 		}
 		return containers[0];
 	}
@@ -1020,33 +1022,43 @@
 	 * Ensures the inventory is loaded, retrying if there's a load error.
 	 * @param {Object} state - The state object.
 	 */
-	async function ensureInventoryLoaded(state) {
-		const retryBtn = document.querySelector("#inventory_load_error_ctn .retry_load_btn");
-		if (retryBtn && isVisible(retryBtn)) {
-			log("Inventory load error detected. Clicking Try Again...");
-			state.ui?.setLastAction?.("Retrying inventory load...");
-			retryBtn.click();
-			const loaded = await waitFor(
-				() => {
-					const errorDiv = document.querySelector("#inventory_load_error_ctn > div");
-					if (errorDiv && isVisible(errorDiv)) return null;
-					const itemHolders = document.querySelectorAll(SELECTORS.ITEM_HOLDER);
-					return itemHolders.length > 0 ? true : null;
-				},
-				{
-					timeoutMs: 5000,
-					intervalMs: 500,
-					label: "inventory load",
-					shouldStop: () => state.stopRequested,
-					pauseState: state,
+		async function ensureInventoryLoaded(state, maxRetries = 2) {
+			let attempts = 0;
+			while (attempts < maxRetries) {
+				if (state.stopRequested) return;
+
+				const retryBtn = document.querySelector("#inventory_load_error_ctn .retry_load_btn");
+				if (retryBtn && isVisible(retryBtn)) {
+					log(`Inventory load error detected. Clicking Try Again... (attempt ${attempts + 1})`);
+					state.ui?.setLastAction?.(`Retrying inventory load... (${attempts + 1}/${maxRetries})`);
+					retryBtn.click();
+					attempts++;
+					const loaded = await waitFor(
+						() => {
+							const errorDiv = document.querySelector("#inventory_load_error_ctn > div");
+							if (errorDiv && isVisible(errorDiv)) return null;
+							const itemHolders = document.querySelectorAll(SELECTORS.ITEM_HOLDER);
+							return itemHolders.length > 0 ? true : null;
+						},
+						{
+							timeoutMs: 5000,
+							intervalMs: 500,
+							label: "inventory load",
+							shouldStop: () => state.stopRequested,
+							pauseState: state,
+						}
+					);
+					if (loaded) return; // Inventory loaded successfully.
+					if (attempts >= maxRetries) {
+						log("Failed to retry inventory load after max attempts.");
+						state.ui?.setLastAction?.("Failed to retry inventory load");
+					}
+				} else {
+					// No error visible — inventory is already loaded.
+					break;
 				}
-			);
-			if (!loaded) {
-				log("Failed to retry inventory load after timeout.");
-				state.ui?.setLastAction?.("Failed to retry inventory load");
 			}
 		}
-	}
 	async function ensureMarketableFilter(state) {
 		state.ui?.setStatus?.("Preparing (ensuring Marketable filter)…", "running");
 		state.ui?.setLastAction?.("Ensuring filters are set");
@@ -1059,14 +1071,32 @@
 		}
 
 		const filterContainer = document.querySelector(SELECTORS.FILTER_CONTAINER);
-		const visibleChildDiv = filterContainer
-			? Array.from(filterContainer.children).find(
-				(child) => child.tagName === "DIV" && isVisible(child)
-			)
-			: null;
+		if (!filterContainer) {
+			log("No filter container found. Skipping filter enforcement.");
+			return;
+		}
 
+		// Start with any currently visible child, or null if none yet.
+		let visibleChildDiv = Array.from(filterContainer.children).find(
+			(child) => child.tagName === "DIV" && isVisible(child)
+		);
+		if (!visibleChildDiv) {
+			log("No visible child div in filter container; waiting for it to appear...");
+		}
+
+		// Poll for either an existing visible child or a newly revealed one.
 		const marketableInput = await waitFor(
-			() => visibleChildDiv?.querySelector(SELECTORS.MARKETABLE_INPUT),
+			() => {
+				// Try the cached child first.
+				const cached = visibleChildDiv?.querySelector(SELECTORS.MARKETABLE_INPUT);
+				if (cached) return cached;
+				// Fall back to re-searching the container.
+				const freshChild = Array.from(filterContainer.children).find(
+					(child) => child.tagName === "DIV" && isVisible(child)
+				);
+				visibleChildDiv = freshChild || visibleChildDiv;
+				return visibleChildDiv?.querySelector(SELECTORS.MARKETABLE_INPUT) || null;
+			},
 			{
 				timeoutMs: runtimeConfig.FILTER_WAIT_TIMEOUT_MS,
 				intervalMs: runtimeConfig.FILTER_POLL_INTERVAL_MS,
@@ -1145,9 +1175,9 @@
 			return { outcome: "stop" };
 		}
 
-		if (usedFallback) {
-			return { outcome: "error", reason: "Fallback used" };
-		}
+		// NOTE: `usedFallback` is always false in this function's current return
+		// paths. The check below is kept for when a future fallback path is added.
+		// if (usedFallback) { return { outcome: "error", reason: "Fallback used" }; }
 
 		if (!price) {
 			log(
@@ -1392,7 +1422,12 @@
 			if (result === "restart") {
 				const restartData = await restartPageProcessing(state);
 				if (!restartData) break;
-				({ itemHolders, itemsOnPage: state.stats.itemsOnPage } = restartData);
+				// Rebuild the live itemHolder array after refresh.
+				itemHolders = Array.from(inventoryPage.querySelectorAll(SELECTORS.ITEM_HOLDER))
+					.filter((holder) => !holder.classList.contains("disabled"))
+					.filter((h) => isVisible(h));
+				state.stats.itemsOnPage = itemHolders.length;
+				state.stats.itemsAttemptedThisPage = 0;
 				currentIndex = 0;
 				visibleIndex = 0;
 				continue;
@@ -1644,6 +1679,8 @@
 
 		const title = document.createElement("div");
 		title.innerHTML = `<span class="sas-title">Auto Sell</span><span class="sas-sub">helper</span>`;
+		// Sanitize: replace any potential script injection with safe text
+		title.innerHTML = title.innerHTML.replace(/<script[^>]*>[\s\S]*?<\/script>/gi, '');
 
 		const headBtns = document.createElement("div");
 		headBtns.className = "sas-headbtns";
@@ -2169,6 +2206,15 @@
 			if (!state.running) return;
 			state.ui.update();
 		}, 1000);
+
+		// Expose a cleanup function so callers can stop the UI ticker when the
+		// script finishes or the panel is destroyed.
+		state.uiCleanup = () => {
+			if (state.uiTicker) {
+				globalThis.clearInterval(state.uiTicker);
+				state.uiTicker = null;
+			}
+		};
 	}
 
 	/**
